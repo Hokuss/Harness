@@ -25,7 +25,6 @@ harness-experimentation/
 ├── src/                # Harness implementation
 ├── tests/              # Test cases and test inputs
 ├── examples/           # Example harnesses and experiments
-├── scripts/            # Helper scripts
 ├── results/            # Generated test results
 ├── docs/               # Experiment notes and documentation
 └── README.md
@@ -37,49 +36,19 @@ harness-experimentation/
 
 ### Prerequisites
 
-Install the tools required by the specific experiment.
-
-For example:
-
-```bash
-git
-cmake
-gcc / clang
-python
-```
-
-The exact requirements may vary between experiments.
+Install the tools required by the repository from the requrements file.
 
 ### Clone the Repository
 
 ```bash
 git clone <repository-url>
-cd harness-experimentation
-```
-
-### Build
-
-For CMake-based experiments:
-
-```bash
-mkdir build
-cd build
-cmake ..
-cmake --build .
+cd harness
 ```
 
 ### Run
 
-Run the harness using the generated executable:
-
 ```bash
-./harness
-```
-
-On Windows:
-
-```powershell
-.\harness.exe
+python main.py <Test version>
 ```
 
 ## Experiments
@@ -116,125 +85,6 @@ Result:
 Conclusion:
     ...
 ```
-
-## Test Harness Design
-
-A typical harness follows this workflow:
-
-```text
-        ┌──────────────┐
-        │ Test Input   │
-        └──────┬───────┘
-               │
-               ▼
-        ┌──────────────┐
-        │ Test Harness │
-        └──────┬───────┘
-               │
-               ▼
-        ┌──────────────┐
-        │ Target Code  │
-        └──────┬───────┘
-               │
-               ▼
-        ┌──────────────┐
-        │ Observation  │
-        └──────┬───────┘
-               │
-               ▼
-        ┌──────────────┐
-        │ Validation   │
-        └──────────────┘
-```
-
-Depending on the experiment, the harness may also handle:
-
-* Input generation
-* Process execution
-* Timeouts
-* Crash detection
-* Output collection
-* Result comparison
-* Logging
-* Reproducibility
-* Cleanup
-
-## Reproducibility
-
-Experiments should be reproducible whenever possible.
-
-If an experiment uses random input generation, record the seed:
-
-```text
-Seed: 12345
-```
-
-This allows a failing test to be reproduced later.
-
-For example:
-
-```bash
-./harness --seed 12345
-```
-
-## Results
-
-Generated results should be kept separate from source code.
-
-For example:
-
-```text
-results/
-├── experiment-001/
-│   ├── summary.txt
-│   ├── failures.txt
-│   └── logs/
-└── experiment-002/
-    └── ...
-```
-
-Large generated files should generally not be committed to Git unless they are required to reproduce an experiment.
-
-## Development Guidelines
-
-Because this is an experimentation repository:
-
-* Keep experiments isolated where possible.
-* Prefer small, focused experiments.
-* Document unexpected behavior.
-* Preserve failing test cases.
-* Record assumptions and limitations.
-* Avoid introducing production-specific dependencies unless necessary.
-* Keep experimental code easy to remove or replace.
-
-## Known Limitations
-
-This repository contains experimental code and therefore:
-
-* APIs may change without notice.
-* Some experiments may be incomplete.
-* Results may not represent production performance.
-* Experimental implementations may contain known bugs.
-* Not every experiment is expected to become part of the final system.
-
-## Future Work
-
-Potential areas for experimentation include:
-
-* Automated test generation
-* Fuzz testing
-* Property-based testing
-* Differential testing
-* Crash detection
-* Coverage-guided testing
-* Performance benchmarking
-* Parallel test execution
-* Automated failure minimization
-* Regression test generation
-
-## License
-
-Add the appropriate project license here.
 
 ## Status
 
