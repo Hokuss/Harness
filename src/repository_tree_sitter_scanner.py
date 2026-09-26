@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import os
 import sys
+import json
+import time
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple
@@ -397,22 +400,58 @@ class RepositoryScanner:
       2. Parses each source file.
       3. Builds a normalised syntax tree.
       4. Aggregates results and statistics.
+      5. Handles fingerprinting and caching.
     """
 
     def __init__(self, exclude_dirs: Optional[Set[str]] = None):
         self.configs = build_language_configs()
         self.parser = TreeSitterParser(self.configs)
-        self.exclude_dirs = exclude_dirs
+        
+        # Define default exclusions, ensuring .cache is ignored
+        if exclude_dirs is None:
+            self.exclude_dirs = {
+                ".git", ".venv", "venv", "__pycache__",
+                "node_modules", "target", "build", "dist",
+                ".mypy_cache", ".pytest_cache", ".tox", ".cache"
+            }
+        else:
+            self.exclude_dirs = exclude_dirs
+
+    def _hash_file_fast(self, path: Path) -> str:
+        """Cheap fingerprint: path + size + mtime."""
+        st = path.stat()
+        h = hashlib.blake2b(digest_size=16)
+        h.update(str(path).encode())
+        h.update(str(st.st_size).encode())
+        h.update(str(int(st.st_mtime_ns)).encode())
+        return h.hexdigest()
+
+    def _compute_repo_fingerprint(self, root: Path) -> Tuple[str, int]:
+        """Return (aggregate_hash, file_count) based on tracked language extensions."""
+        # Dynamically build tracked extensions from language configs
+        tracked_exts = {
+            ext for cfg in self.configs.values() for ext in cfg.extensions
+        }
+
+        entries = []
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+            dirnames[:] = [d for d in dirnames if d not in self.exclude_dirs]
+            for name in filenames:
+                p = Path(dirpath) / name
+                if p.suffix.lower() in tracked_exts:
+                    rel = p.relative_to(root).as_posix()
+                    entries.append(f"{rel}:{self._hash_file_fast(p)}")
+
+        entries.sort()
+        agg = hashlib.blake2b(digest_size=16)
+        for e in entries:
+            agg.update(e.encode())
+            agg.update(b"\n")
+        return agg.hexdigest(), len(entries)
 
     def scan(self, root_path: str | Path) -> ScanResult:
         """
         Scan a repository and return a ScanResult.
-
-        Internal operations:
-          - Iterates SourceFile objects from walk_repository.
-          - Parses each with Tree-sitter.
-          - Builds SyntaxNode tree via TreeBuilder.
-          - Tracks per-language file counts and node counts.
         """
         root = Path(root_path).resolve()
         result = ScanResult(root_path=str(root))
@@ -434,8 +473,6 @@ class RepositoryScanner:
                 config = self.configs[lang]
                 builder = TreeBuilder(config)
                 file_result.root_node = builder.build(tree)
-
-                # Count nodes recursively
                 total_nodes += self._count_nodes(file_result.root_node)
 
             except Exception as exc:
@@ -451,6 +488,63 @@ class RepositoryScanner:
         }
 
         return result
+
+    def get_repo_tree(self, root_path: str | Path, force_refresh: bool = False) -> Dict[str, Any]:
+        """
+        Return the full repo tree as a dict, managing the JSON cache internally.
+        """
+        root = Path(root_path).resolve()
+        cache_dir = root / ".cache"
+        cache_file = cache_dir / "repo_tree.json"
+        cache_meta = cache_dir / "repo_tree.meta.json"
+
+        t0 = time.time()
+        fingerprint, file_count = self._compute_repo_fingerprint(root)
+
+        # ── Attempt Cache Load ───────────────────────────────────────────
+        if not force_refresh:
+            if cache_file.exists() and cache_meta.exists():
+                try:
+                    meta = json.loads(cache_meta.read_text(encoding="utf-8"))
+                    if meta.get("fingerprint") == fingerprint:
+                        tree = json.loads(cache_file.read_text(encoding="utf-8"))
+                        print(f"[cache] HIT  ({file_count} files, loaded in {time.time() - t0:.3f}s)")
+                        return tree
+                    else:
+                        print("[cache] MISS (repo changed since last scan)")
+                except (OSError, json.JSONDecodeError) as exc:
+                    print(f"[cache] unreadable, will rebuild ({exc})")
+            else:
+                print("[cache] MISS (no cache on disk)")
+        else:
+            print("[cache] forced refresh")
+
+        # ── Build fresh ──────────────────────────────────────────────────
+        result = self.scan(root)
+        tree = result.to_dict()
+
+        # ── Save cache ───────────────────────────────────────────────────
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "fingerprint": fingerprint,
+            "file_count": file_count,
+            "created_at": time.time(),
+            "scanner_version": 1,
+        }
+        
+        tmp_tree = cache_file.with_suffix(".json.tmp")
+        tmp_meta = cache_meta.with_suffix(".json.tmp")
+        tmp_tree.write_text(json.dumps(tree, indent=2), encoding="utf-8")
+        tmp_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        tmp_tree.replace(cache_file)
+        tmp_meta.replace(cache_meta)
+        
+        print(f"[cache] wrote {cache_file} ({cache_file.stat().st_size / 1024:.1f} KB)")
+        print(f"[cache] scan + write done in {time.time() - t0:.3f}s "
+              f"({result.stats.get('total_files', 0)} files, "
+              f"{result.stats.get('total_nodes', 0)} nodes)")
+
+        return tree
 
     @staticmethod
     def _count_nodes(node: SyntaxNode) -> int:

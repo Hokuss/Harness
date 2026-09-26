@@ -1,4 +1,4 @@
-# Harness Experimentation
+# Harness
 
 A sandbox repository for experimenting with test harnesses, automated testing, and different approaches to validating software components.
 
@@ -21,12 +21,9 @@ The code in this repository is **experimental** and may change frequently.
 ## Project Structure
 
 ```text
-harness-experimentation/
+harness/
 ├── src/                # Harness implementation
-├── tests/              # Test cases and test inputs
-├── examples/           # Example harnesses and experiments
-├── results/            # Generated test results
-├── docs/               # Experiment notes and documentation
+├── test/              # Test cases and test inputs
 └── README.md
 ```
 
@@ -48,42 +45,7 @@ cd harness
 ### Run
 
 ```bash
-python main.py <Test version>
-```
-
-## Experiments
-
-Each experiment should focus on a specific harness design or testing problem.
-
-A typical experiment should document:
-
-1. **Objective** – What are we trying to test?
-2. **Approach** – How does the harness work?
-3. **Input** – What data or program is being tested?
-4. **Expected Result** – What should happen?
-5. **Observed Result** – What actually happened?
-6. **Limitations** – What does the experiment not cover?
-7. **Conclusion** – What did we learn?
-
-Example:
-
-```text
-Experiment: Input Generation
-
-Objective:
-    Determine whether automatically generated inputs
-    can expose edge cases in the target program.
-
-Approach:
-    Generate a collection of valid and invalid inputs,
-    execute the target, and compare the observed behavior
-    against the expected behavior.
-
-Result:
-    ...
-
-Conclusion:
-    ...
+python src/harness.py
 ```
 
 ## Status
