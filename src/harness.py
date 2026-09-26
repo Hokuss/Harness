@@ -6,11 +6,18 @@ from typing import List, Dict, Any, Tuple, Optional
 from dotenv import load_dotenv
 from google import genai
 from openai import OpenAI
+from pathlib import Path
 
 # Import tools from functions.py
-import functions 
+from . import functions 
+from .repository_tree_sitter_scanner import RepositoryScanner
 
 load_dotenv()
+
+# ==========================================
+# Configuration
+# ==========================================
+TARGET_DIR = "test"
 
 # ==========================================
 # 1. Client Setup
@@ -105,31 +112,23 @@ TRACKER = ModelTracker()
 # 3. Universal API Runner with Fallback
 # ==========================================
 def chat_with_fallback(messages: List[Dict[str, str]]) -> Tuple[str, Optional[Dict[str, Any]]]:
-    """
-    Tries each model in the pipeline.
-    Passes tools natively to prevent OpenRouter/Groq 400 proxy validation errors.
-    Returns: (text_content, tool_call_dict)
-    """
     for provider, model in MODEL_PIPELINE:
         if TRACKER.is_failed(provider, model):
             continue
 
         try:
-            print(f"  [API] Trying {provider} -> {model}...")
-
             if provider in ["groq", "openrouter"]:
                 client = groq_client if provider == "groq" else openrouter_client
                 res = client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    tools=OPENAI_TOOLS,       # Passed natively to satisfy API proxy rules
+                    tools=OPENAI_TOOLS,
                     tool_choice="auto",
                     temperature=0.2
                 )
                 choice = res.choices[0]
                 text = choice.message.content or ""
 
-                # Handle native tool calls if generated
                 if choice.message.tool_calls:
                     tc = choice.message.tool_calls[0]
                     try:
@@ -141,7 +140,6 @@ def chat_with_fallback(messages: List[Dict[str, str]]) -> Tuple[str, Optional[Di
                 return text, None
 
             elif provider == "google":
-                # Format messages for Google GenAI SDK
                 system_instruction = None
                 contents = []
                 for msg in messages:
@@ -172,17 +170,49 @@ def chat_with_fallback(messages: List[Dict[str, str]]) -> Tuple[str, Optional[Di
 # 4. Harness Agent
 # ==========================================
 class HarnessAgent:
-    def __init__(self, max_iterations: int = 15):
+    def __init__(self, target_dir: str = TARGET_DIR, max_iterations: int = 15):
+        self.target_dir = target_dir
         self.max_iterations = max_iterations
         self.messages = []
         
-        # Build tool context for system prompt
+        print(f"🌲 Initializing Tree-sitter scanner for '{self.target_dir}'...")
+        scanner = RepositoryScanner()
+        target_path = Path(self.target_dir).resolve()
+        
+        repo_tree = scanner.get_repo_tree(target_path, force_refresh=True)
+        
+        for f in repo_tree["files"]:
+            f["path"] = f"{self.target_dir}/{f['path']}"
+        repo_tree["root_path"] = str(Path(".").resolve())
+        
+        functions._TREE = repo_tree
+        functions.REPO_ROOT = Path(".").resolve()
+
+        stats = repo_tree.get("stats", {})
+        files_count = stats.get("total_files", 0)
+        langs = ", ".join(stats.get("files_by_language", {}).keys())
+        
+        dir_structure = set()
+        for f in repo_tree["files"]:
+            parts = Path(f["path"]).parts
+            if len(parts) > 1:
+                dir_structure.add(parts[1])
+
+        architecture_context = (
+            f"### Project Architecture Summary\n"
+            f"- Total tracked files: {files_count}\n"
+            f"- Languages detected: {langs}\n"
+            f"- Primary subdirectories: {', '.join(sorted(dir_structure)) or 'Flat structure'}\n"
+        )
+
         tools_info = []
         for t in functions.TOOLS:
             tools_info.append(f"- **{t['name']}**: {t['description']}")
         tools_str = "\n".join(tools_info)
 
         self.system_prompt = f"""You are an autonomous AI coding assistant running inside a repository harness.
+
+{architecture_context}
 
 ### Available Tools:
 {tools_str}
@@ -198,12 +228,21 @@ class HarnessAgent:
 """
         self.messages.append({"role": "system", "content": self.system_prompt})
 
+    def enforce_target_dir(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        path_keys = {"path", "directory", "file_pattern", "file_path", "file_glob"}
+        for k, v in args.items():
+            if k in path_keys and isinstance(v, str):
+                clean_path = v.lstrip("./\\")
+                if clean_path == "":
+                    args[k] = self.target_dir
+                elif not clean_path.startswith(f"{self.target_dir}/") and clean_path != self.target_dir:
+                    args[k] = f"{self.target_dir}/{clean_path}"
+        return args
+
     def parse_text_tool_call(self, text: str) -> Optional[Dict[str, Any]]:
-        """Fallback parser for models that format tool calls in text."""
         if not text:
             return None
 
-        # Look for <tool_call>...</tool_call> tags
         match = re.search(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)
         if match:
             try:
@@ -211,7 +250,6 @@ class HarnessAgent:
             except json.JSONDecodeError:
                 pass
 
-        # Look for raw JSON objects with "name" and "arguments"
         match_json = re.search(r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{.*?\}\s*\}', text, re.DOTALL)
         if match_json:
             try:
@@ -223,42 +261,63 @@ class HarnessAgent:
 
     def run(self, user_task: str):
         self.messages.append({"role": "user", "content": user_task})
-        print(f"\n[Task] {user_task}\n")
+        
+        print("\n" + "="*50)
+        print(f"[Initial Task] {user_task}")
+        print("="*50)
 
         for step in range(self.max_iterations):
-            print(f"--- Step {step + 1} ---")
+            print(f"\n" + "-"*20 + f" Step {step + 1} " + "-"*20)
+            
+            # Print the latest prompt being sent to the model (excluding system prompt for brevity)
+            latest_msg = self.messages[-1]
+            print(f"\n[Prompt Sent to Model ({latest_msg['role']})]")
+            print(latest_msg["content"].strip())
+            print("-" * 50)
 
-            # 1. Call API with model rotation
             text_response, native_tool_call = chat_with_fallback(self.messages)
+            
+            # Print raw model reply
+            print(f"\n[Model Raw Reply]")
+            if text_response:
+                print(f"Message: {text_response.strip()}")
+            else:
+                print("Message: <Empty (Model chose to emit a native tool call only)>")
+                
+            if native_tool_call:
+                print(f"Tool Call: {json.dumps(native_tool_call)}")
+            print("-" * 50)
 
-            # 2. Determine tool call (Native takes priority, text parsing acts as fallback)
             tool_call = native_tool_call or self.parse_text_tool_call(text_response)
 
-            # Append assistant's thoughts/text to message history
             assistant_content = text_response if text_response else f"Calling tool: {tool_call.get('name')}"
             self.messages.append({"role": "assistant", "content": assistant_content})
 
             if tool_call:
                 tool_name = tool_call.get("name")
-                tool_args = tool_call.get("arguments", {})
-                print(f"🛠️  Executing: {tool_name}({json.dumps(tool_args)})")
+                raw_args = tool_call.get("arguments", {})
+                
+                tool_args = self.enforce_target_dir(raw_args)
+                
+                print(f"\n🛠️  Executing Tool: {tool_name}")
+                print(f"Arguments: {json.dumps(tool_args, indent=2)}")
 
-                # 3. Execute tool via functions dispatch
                 try:
                     result = functions.call_tool(tool_name, tool_args)
                     observation = json.dumps(result, indent=2)[:functions.MAX_OUTPUT_BYTES]
                 except Exception as e:
                     observation = f"Error executing {tool_name}: {e}"
 
-                # 4. Feed observation back to conversation history
+                # Print the raw tool output
+                print(f"\n[Tool Output Result]")
+                print(observation)
+                print("=" * 50)
+
                 obs_message = f"Tool Output for {tool_name}:\n{observation}"
                 self.messages.append({"role": "user", "content": obs_message})
-                print(f"✅ Result received ({len(obs_message)} chars). Proceeding...\n")
 
             else:
-                # No tool call means final response reached
-                print("\n[Final Answer]")
-                print(text_response)
+                print("\n[Final Answer Reached]")
                 break
         else:
             print(f"\n[Terminated] Hit max iteration limit ({self.max_iterations}).")
