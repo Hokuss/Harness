@@ -172,7 +172,41 @@ TRACKER = ModelTracker()
 # ==========================================
 # 3. Universal API Runner with Fallback
 # ==========================================
-def chat_with_fallback(messages: List[Dict[str, str]]) -> Tuple[str, Optional[Dict[str, Any]]]:
+MAX_TRANSIENT_RETRIES = 2      # extra attempts (beyond the first) for retryable errors
+RETRY_BACKOFF_BASE_S = 1.0     # doubles each retry: 1s, 2s
+
+ModelInfo = Dict[str, str]     # {"provider": ..., "model": ...}
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """
+    Rate limits (429) and server-side errors (5xx) are usually gone in a
+    few seconds — worth a quick retry before giving up on a model for the
+    rest of the run. Auth/permission/bad-request errors never resolve on
+    retry, so those should blacklist immediately.
+
+    openai's APIStatusError subclasses carry `.status_code`; google-genai's
+    APIError subclasses carry `.code`. Network-level errors (timeouts,
+    connection drops) carry neither and are treated as transient too.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "code", None)
+    if isinstance(status, int):
+        return status == 429 or status >= 500
+    return True
+
+
+def chat_with_fallback(
+    messages: List[Dict[str, str]]
+) -> Tuple[str, List[Dict[str, Any]], ModelInfo]:
+    """
+    Try each (provider, model) in MODEL_PIPELINE in order, skipping ones
+    already blacklisted this run. Returns (text, tool_calls, model_info)
+    where tool_calls is a list (possibly empty — a model can request
+    several tool calls in one turn, not just one) and model_info records
+    which (provider, model) actually answered.
+    """
     for provider, model in MODEL_PIPELINE:
         if TRACKER.is_failed(provider, model):
             continue
@@ -186,53 +220,65 @@ def chat_with_fallback(messages: List[Dict[str, str]]) -> Tuple[str, Optional[Di
             TRACKER.mark_failed(provider, model, "no API key configured")
             continue
 
-        try:
-            if provider in OPENAI_STYLE_CLIENTS:
-                client = OPENAI_STYLE_CLIENTS[provider]
-                res = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    tools=OPENAI_TOOLS,
-                    tool_choice="auto",
-                    temperature=0.2
-                )
-                choice = res.choices[0]
-                text = choice.message.content or ""
+        attempt = 0
+        while True:
+            try:
+                if provider in OPENAI_STYLE_CLIENTS:
+                    client = OPENAI_STYLE_CLIENTS[provider]
+                    res = client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        tools=OPENAI_TOOLS,
+                        tool_choice="auto",
+                        temperature=0.2
+                    )
+                    choice = res.choices[0]
+                    text = choice.message.content or ""
 
-                if choice.message.tool_calls:
-                    tc = choice.message.tool_calls[0]
-                    try:
-                        args = json.loads(tc.function.arguments)
-                    except json.JSONDecodeError:
-                        args = {}
-                    return text, {"name": tc.function.name, "arguments": args}
+                    tool_calls: List[Dict[str, Any]] = []
+                    for tc in (choice.message.tool_calls or []):
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError:
+                            args = {}
+                        tool_calls.append({"name": tc.function.name, "arguments": args})
 
-                return text, None
+                    return text, tool_calls, {"provider": provider, "model": model}
 
-            elif provider == "google":
-                system_instruction = None
-                contents = []
-                for msg in messages:
-                    if msg["role"] == "system":
-                        system_instruction = msg["content"]
-                    else:
-                        role = "user" if msg["role"] == "user" else "model"
-                        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+                elif provider == "google":
+                    system_instruction = None
+                    contents = []
+                    for msg in messages:
+                        if msg["role"] == "system":
+                            system_instruction = msg["content"]
+                        else:
+                            role = "user" if msg["role"] == "user" else "model"
+                            contents.append({"role": role, "parts": [{"text": msg["content"]}]})
 
-                res = google_client.models.generate_content(
-                    model=model,
-                    contents=contents,
-                    config={
-                        "system_instruction": system_instruction,
-                        "temperature": 0.2
-                    }
-                )
-                return res.text or "", None
+                    res = google_client.models.generate_content(
+                        model=model,
+                        contents=contents,
+                        config={
+                            "system_instruction": system_instruction,
+                            "temperature": 0.2
+                        }
+                    )
+                    return res.text or "", [], {"provider": provider, "model": model}
 
-        except Exception as e:
-            err_type = type(e).__name__
-            print(f"  [API Error] {provider} -> {model} failed ({err_type}: {e})")
-            TRACKER.mark_failed(provider, model, err_type)
+            except Exception as e:
+                err_type = type(e).__name__
+                if _is_transient_error(e) and attempt < MAX_TRANSIENT_RETRIES:
+                    attempt += 1
+                    wait = RETRY_BACKOFF_BASE_S * (2 ** (attempt - 1))
+                    print(f"  [Retry] {provider} -> {model} transient error "
+                          f"({err_type}); retrying in {wait:.1f}s "
+                          f"(attempt {attempt}/{MAX_TRANSIENT_RETRIES})")
+                    time.sleep(wait)
+                    continue
+
+                print(f"  [API Error] {provider} -> {model} failed ({err_type}: {e})")
+                TRACKER.mark_failed(provider, model, err_type)
+                break  # give up on this (provider, model); try the next one
 
     raise RuntimeError(f"All models failed or were rate-limited. Summary: {TRACKER.status_summary()}")
 
@@ -288,11 +334,12 @@ class HarnessAgent:
 {tools_str}
 
 ### Instructions:
-1. You can call tools natively or output a structured tool call block:
+1. You can call tools natively, or output one or more structured tool call
+   blocks in a single reply:
 <tool_call>
 {{"name": "tool_name", "arguments": {{"arg1": "value1"}}}}
 </tool_call>
-2. Execute ONE tool per turn and wait for the tool output observation.
+2. All tool calls in a turn are executed before you see any results.
 3. Always search or read files before attempting edits.
 4. The repo's syntax tree is large — prefer search_symbols / get_file_outline
    first, then get_adjacent_nodes or get_node(depth=1) to zoom in on a
@@ -312,25 +359,28 @@ class HarnessAgent:
                     args[k] = f"{self.target_dir}/{clean_path}"
         return args
 
-    def parse_text_tool_call(self, text: str) -> Optional[Dict[str, Any]]:
+    def parse_text_tool_calls(self, text: str) -> List[Dict[str, Any]]:
+        """Parse zero or more <tool_call>...</tool_call> blocks from a text reply."""
         if not text:
-            return None
+            return []
 
-        match = re.search(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)
-        if match:
+        calls: List[Dict[str, Any]] = []
+        for match in re.finditer(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL):
             try:
-                return json.loads(match.group(1).strip())
+                calls.append(json.loads(match.group(1).strip()))
             except json.JSONDecodeError:
                 pass
+        if calls:
+            return calls
 
         match_json = re.search(r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{.*?\}\s*\}', text, re.DOTALL)
         if match_json:
             try:
-                return json.loads(match_json.group(0).strip())
+                return [json.loads(match_json.group(0).strip())]
             except json.JSONDecodeError:
                 pass
 
-        return None
+        return []
 
     def run_stream(self, user_task: str):
         """
@@ -341,7 +391,7 @@ class HarnessAgent:
         Event shapes:
           {"type": "user", "content": str}
           {"type": "step_start", "step": int, "prompt_role": str, "prompt_content": str}
-          {"type": "assistant", "content": str}
+          {"type": "assistant", "content": str, "provider": str, "model": str}
           {"type": "tool_call", "name": str, "arguments": dict}
           {"type": "tool_result", "name": str, "result": Any}
           {"type": "final", "content": str}
@@ -361,36 +411,45 @@ class HarnessAgent:
             }
 
             try:
-                text_response, native_tool_call = chat_with_fallback(self.messages)
+                text_response, native_tool_calls, model_info = chat_with_fallback(self.messages)
             except RuntimeError as exc:
                 yield {"type": "error", "content": str(exc)}
                 return
 
-            tool_call = native_tool_call or self.parse_text_tool_call(text_response)
+            tool_calls = native_tool_calls or self.parse_text_tool_calls(text_response)
 
             assistant_content = text_response if text_response else (
-                f"Calling tool: {tool_call.get('name')}" if tool_call else ""
+                f"Calling tools: {', '.join(tc.get('name', '?') for tc in tool_calls)}"
+                if tool_calls else ""
             )
             self.messages.append({"role": "assistant", "content": assistant_content})
-            yield {"type": "assistant", "content": text_response or ""}
+            yield {
+                "type": "assistant",
+                "content": text_response or "",
+                "provider": model_info["provider"],
+                "model": model_info["model"],
+            }
 
-            if tool_call:
-                tool_name = tool_call.get("name")
-                raw_args = tool_call.get("arguments", {})
-                tool_args = self.enforce_target_dir(raw_args)
+            if tool_calls:
+                observations = []
+                for tool_call in tool_calls:
+                    tool_name = tool_call.get("name")
+                    raw_args = tool_call.get("arguments", {})
+                    tool_args = self.enforce_target_dir(raw_args)
 
-                yield {"type": "tool_call", "name": tool_name, "arguments": tool_args}
+                    yield {"type": "tool_call", "name": tool_name, "arguments": tool_args}
 
-                try:
-                    result = call_tool(tool_name, tool_args)
-                    observation = json.dumps(result, indent=2)[:functions.MAX_OUTPUT_BYTES]
-                except Exception as e:
-                    result = {"error": f"{type(e).__name__}: {e}"}
-                    observation = f"Error executing {tool_name}: {e}"
+                    try:
+                        result = call_tool(tool_name, tool_args)
+                        observation = json.dumps(result, indent=2)[:functions.MAX_OUTPUT_BYTES]
+                    except Exception as e:
+                        result = {"error": f"{type(e).__name__}: {e}"}
+                        observation = f"Error executing {tool_name}: {e}"
 
-                yield {"type": "tool_result", "name": tool_name, "result": result}
+                    yield {"type": "tool_result", "name": tool_name, "result": result}
+                    observations.append(f"Tool Output for {tool_name}:\n{observation}")
 
-                obs_message = f"Tool Output for {tool_name}:\n{observation}"
+                obs_message = "\n\n".join(observations)
                 self.messages.append({"role": "user", "content": obs_message})
             else:
                 yield {"type": "final", "content": text_response or ""}
@@ -417,7 +476,7 @@ class HarnessAgent:
                 print("-" * 50)
 
             elif et == "assistant":
-                print("\n[Model Raw Reply]")
+                print(f"\n[Model Raw Reply] (answered by {event['provider']}:{event['model']})")
                 if event["content"]:
                     print(f"Message: {event['content'].strip()}")
                 else:

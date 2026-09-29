@@ -1,7 +1,12 @@
-tree-sitter>=0.21.0
-tree-sitter-cpp>=0.23.0
-tree-sitter-rust>=0.23.0
-tree-sitter-python>=0.23.0
+# Exact-pinned, not >=: tree-sitter 0.26.0 core segfaults walking the
+# syntax tree of any moderately large file (reproduced on a 400-function
+# synthetic file, not content-specific) when paired with these grammar
+# versions. 0.25.0 core is verified compatible with all three grammars
+# below — do not loosen this without re-testing against a large repo.
+tree-sitter==0.25.0
+tree-sitter-cpp==0.23.4
+tree-sitter-rust==0.24.2
+tree-sitter-python==0.25.0
 python-dotenv>=1.0.0
 openai>=1.0.0
 google-genai>=1.0.0

@@ -2,10 +2,11 @@ const logEl = document.getElementById("log");
 const formEl = document.getElementById("chat-form");
 const inputEl = document.getElementById("chat-input");
 const sendBtn = document.getElementById("send-btn");
-const resetBtn = document.getElementById("reset-btn");
 const statusEl = document.getElementById("status");
 const toolListEl = document.getElementById("tool-list");
 const toolCountEl = document.getElementById("tool-count");
+const targetSelectEl = document.getElementById("target-select");
+const applyTargetBtn = document.getElementById("apply-target-btn");
 
 function scrollToBottom() {
   logEl.scrollTop = logEl.scrollHeight;
@@ -54,6 +55,21 @@ async function loadStatus() {
     li.innerHTML = `<b>${t.name}</b> — ${t.description}`;
     toolListEl.appendChild(li);
   }
+
+  await loadTargets(data.target_dir);
+}
+
+async function loadTargets(selected) {
+  const res = await fetch("/api/targets");
+  const data = await res.json();
+  targetSelectEl.innerHTML = "";
+  for (const name of data.available) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    if (name === (selected || data.current)) opt.selected = true;
+    targetSelectEl.appendChild(opt);
+  }
 }
 
 function handleEvent(evt) {
@@ -63,6 +79,12 @@ function handleEvent(evt) {
       // already convey progress; a per-step divider would just be noise.
       break;
     case "assistant":
+      if (evt.provider && evt.model) {
+        const tag = document.createElement("div");
+        tag.className = "model-tag";
+        tag.textContent = `via ${evt.provider}:${evt.model}`;
+        logEl.appendChild(tag);
+      }
       if (evt.content && evt.content.trim()) {
         addBubble(evt.content.trim(), "assistant");
       }
@@ -161,10 +183,20 @@ formEl.addEventListener("submit", (e) => {
   sendMessage(message);
 });
 
-resetBtn.addEventListener("click", async () => {
-  await fetch("/api/reset", { method: "POST" });
+applyTargetBtn.addEventListener("click", async () => {
+  const target_dir = targetSelectEl.value;
+  const res = await fetch("/api/reset", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target_dir }),
+  });
+  const data = await res.json();
   logEl.innerHTML = "";
-  addBubble("Conversation reset.", "system-note");
+  if (!res.ok) {
+    addBubble(`Failed to switch target: ${data.error}`, "error");
+    return;
+  }
+  addBubble(`Switched target to "${data.target_dir}". Conversation reset.`, "system-note");
   await loadStatus();
 });
 
