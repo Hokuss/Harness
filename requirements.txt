@@ -1,5 +1,10 @@
-ipykerenel
 tree-sitter>=0.21.0
 tree-sitter-cpp>=0.23.0
 tree-sitter-rust>=0.23.0
 tree-sitter-python>=0.23.0
+python-dotenv>=1.0.0
+openai>=1.0.0
+google-genai>=1.0.0
+flask>=3.0.0
+ddgs>=9.0.0
+ipykernel
