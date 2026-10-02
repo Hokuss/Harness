@@ -117,7 +117,37 @@ def _summarize(node: Dict[str, Any], nid: str, file_path: str) -> Dict[str, Any]
         "name": node.get("name"),
         "start_line": node["start_point"][0],
         "end_line": node["end_point"][0],
+        "child_count": len(node.get("children", [])),
     }
+
+
+def _truncate_node(node: Dict[str, Any], file_path: str, depth: int) -> Dict[str, Any]:
+    """
+    Shallow view of a node: expand `children` for `depth` levels, then stop —
+    deeper descendants collapse to their node_id/kind/name/child_count only.
+    Call get_node again on a child's node_id (or pass a larger depth) to go
+    further. Without this cap, get_node on a large class/function would dump
+    its entire subtree — hundreds of nodes — in one shot.
+    """
+    nid = _node_id(file_path, node)
+    out = {
+        "node_id": nid,
+        "type": node["type"],
+        "raw_type": node["raw_type"],
+        "name": node.get("name"),
+        "start_point": node["start_point"],
+        "end_point": node["end_point"],
+        "start_byte": node["start_byte"],
+        "end_byte": node["end_byte"],
+        "child_count": len(node.get("children", [])),
+    }
+    if depth > 0:
+        out["children"] = [
+            _truncate_node(c, file_path, depth - 1) for c in node.get("children", [])
+        ]
+    else:
+        out["children"] = None
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -731,15 +761,24 @@ def get_file_outline(path: str) -> Dict[str, Any]:
 # TOOL: get_node
 # ══════════════════════════════════════════════════════════════════════
 
-def get_node(node_id: str) -> Dict[str, Any]:
-    """Return the raw node dict for a given node_id."""
+def get_node(node_id: str, depth: int = 1) -> Dict[str, Any]:
+    """
+    Return a node's detail, expanding `children` up to `depth` levels deep
+    (default 1). Nodes beyond that depth collapse to a stub
+    (node_id/type/name/child_count) rather than being fully expanded —
+    call get_node again on a specific child's node_id, or raise `depth`,
+    to go further. This keeps a single call cheap even for a large
+    class or function body.
+    """
     entry = _index().get(node_id)
     if entry is None:
         return {"error": f"unknown node_id: {node_id}"}
+
+    depth = max(0, min(depth, 5))
     return {
         "node_id": node_id,
         "file": entry["file"],
-        "node": entry["node"],
+        "node": _truncate_node(entry["node"], entry["file"], depth),
     }
 
 
@@ -829,10 +868,18 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "get_node",
-        "description": "Return the raw syntax-tree node for a given node_id.",
+        "description": (
+            "Return the syntax-tree node for a given node_id, expanded `depth` "
+            "levels deep (default 1). Deeper descendants collapse to a stub "
+            "(node_id/type/name/child_count) — call again on a child's node_id "
+            "to expand further. Avoids dumping an entire subtree at once."
+        ),
         "input_schema": {
             "type": "object",
-            "properties": {"node_id": {"type": "string"}},
+            "properties": {
+                "node_id": {"type": "string"},
+                "depth": {"type": "integer", "default": 1},
+            },
             "required": ["node_id"],
         },
     },

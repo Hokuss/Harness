@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Harness</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <h1>🌲 Harness</h1>
+      <div id="status" class="status">Loading repo status…</div>
+
+      <details class="tools-panel">
+        <summary>Available tools (<span id="tool-count">…</span>)</summary>
+        <ul id="tool-list"></ul>
+      </details>
+
+      <div class="target-panel">
+        <label for="target-select">Target directory</label>
+        <select id="target-select"></select>
+        <button id="apply-target-btn">Switch target</button>
+      </div>
+    </aside>
+
+    <main class="chat">
+      <div id="log" class="log"></div>
+
+      <form id="chat-form" class="input-row">
+        <input id="chat-input" type="text" placeholder="Ask the agent about the repo…" autocomplete="off" />
+        <button type="submit" id="send-btn">Send</button>
+      </form>
+    </main>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
