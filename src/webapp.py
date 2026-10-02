@@ -106,6 +106,7 @@ def chat():
     def generate() -> Iterator[str]:
         try:
             for event in agent.run_stream(message):
+                print("SSE ->", event.get("type"), str(event.get("content"))[:80], flush=True)
                 yield _sse(event)
         except Exception as exc:
             # Keep the stream well-formed even if something throws mid-loop —

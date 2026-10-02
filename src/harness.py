@@ -31,6 +31,11 @@ load_dotenv()
 # ==========================================
 TARGET_DIR = "test"
 
+# Request-level timeout for every provider. The OpenAI SDK default is
+# 600s and google-genai is similarly generous; without an explicit cap a
+# slow request looks identical to a deadlock.
+REQUEST_TIMEOUT_S = 90.0
+
 # ==========================================
 # 1. Client Setup
 # ==========================================
@@ -42,14 +47,25 @@ def _make_openai_client(base_url: str, api_key_env: str) -> Optional[OpenAI]:
     key = os.getenv(api_key_env)
     if not key:
         return None
-    return OpenAI(base_url=base_url, api_key=key)
+    return OpenAI(
+        base_url=base_url,
+        api_key=key,
+        timeout=REQUEST_TIMEOUT_S,
+        # Disable the SDK's own retry loop — we run our own retry + failover
+        # and stacked retries silently multiply wall-clock time on 429s.
+        max_retries=0,
+    )
 
 
 def _make_google_client() -> Optional[genai.Client]:
     key = os.getenv("GEMINI_API_KEY")
     if not key:
         return None
-    return genai.Client(api_key=key)
+    return genai.Client(
+        api_key=key,
+        # google-genai takes millisecond timeouts via http_options.
+        http_options={"timeout": int(REQUEST_TIMEOUT_S * 1000)},
+    )
 
 
 groq_client = _make_openai_client("https://api.groq.com/openai/v1", "GROQ_API_KEY")
@@ -105,27 +121,10 @@ MODEL_PIPELINE = [
     ("groq", "openai/gpt-oss-20b"),
     ("groq", "openai/gpt-oss-120b"),
     ("groq", "qwen/qwen3.8-27b"),
-    # ==========================================
-    # Fireworks.ai (Free $1 credit, no card at signup)
-    # Note: card only needed to lift the default 10 RPM cap.
-    # ==========================================
-    ("fireworks", "accounts/fireworks/models/firefunction-v2"),
-    # ==========================================
-    # OpenRouter (Free Tier)
-    # Note: The ":free" suffix is MANDATORY.
-    # OpenRouter rotates these based on sponsorships.
-    # ==========================================
-    ("openrouter", "qwen/qwen3.8-27b:free"),
     # ("openrouter", "thinkingmachines/inkling-small:free"),
     ("openrouter", "google/gemma-4-26b-a4b-it:free"),
     ("openrouter", "google/gemma-4-31b-it:free"),
     ("openrouter", "cohere/north-mini-code:free"),
-    # ==========================================
-    # Cerebras Cloud (Free trial, card required, fastest tokens/sec)
-    # Note: ~5 RPM / 90K burst TPM / 1M TPD per model on the trial tier.
-    # ==========================================
-    ("cerebras", "gpt-oss-120b"),
-    ("cerebras", "qwen-3.8-27b"),
 
     # ==========================================
     # Google GenAI (Free Tier)
@@ -177,24 +176,97 @@ RETRY_BACKOFF_BASE_S = 1.0     # doubles each retry: 1s, 2s
 
 ModelInfo = Dict[str, str]     # {"provider": ..., "model": ...}
 
+# Substrings that indicate the *payload* is too big, not that we're being
+# throttled for request rate. A 429 mentioning tokens-per-minute is a
+# size problem: waiting won't help, sending a smaller prompt will.
+_CONTEXT_LENGTH_MARKERS = (
+    "context length",
+    "context_length_exceeded",
+    "context window",
+    "maximum context",
+    "max context",
+    "too many tokens",
+    "tokens per minute",
+    "token quota",
+    "reduce the length",
+    "reduce your prompt",
+    "request too large",
+    "payload too large",
+    "input is too long",
+    "prompt is too long",
+    "exceeds the maximum",
+)
 
-def _is_transient_error(exc: Exception) -> bool:
-    """
-    Rate limits (429) and server-side errors (5xx) are usually gone in a
-    few seconds — worth a quick retry before giving up on a model for the
-    rest of the run. Auth/permission/bad-request errors never resolve on
-    retry, so those should blacklist immediately.
 
-    openai's APIStatusError subclasses carry `.status_code`; google-genai's
-    APIError subclasses carry `.code`. Network-level errors (timeouts,
-    connection drops) carry neither and are treated as transient too.
-    """
+def _error_status(exc: Exception) -> Optional[int]:
+    """Pull an HTTP-ish status code off an SDK exception, if it has one."""
     status = getattr(exc, "status_code", None)
     if status is None:
         status = getattr(exc, "code", None)
-    if isinstance(status, int):
-        return status == 429 or status >= 500
-    return True
+    return status if isinstance(status, int) else None
+
+
+def _classify_error(exc: Exception) -> str:
+    """
+    Return one of:
+      'context_length' — payload too large; retrying identical bytes is useless.
+      'transient'      — 429 (rate), 5xx, or network-level; worth a quick retry.
+      'permanent'      — auth/bad-request/etc.; fail over immediately.
+    """
+    msg = str(exc).lower()
+    status = _error_status(exc)
+
+    if any(marker in msg for marker in _CONTEXT_LENGTH_MARKERS):
+        return "context_length"
+    if status == 429 or (status is not None and status >= 500):
+        return "transient"
+    if status is not None:
+        return "permanent"
+    # No status attached: network timeout / connection drop — transient.
+    return "transient"
+
+
+def _compact_messages(
+    messages: List[Dict[str, str]],
+    keep_tail: int = 4,
+    tool_output_chars: int = 1500,
+) -> None:
+    """
+    Shrink an oversized conversation *in place* so the next model in the
+    pipeline has a fighting chance. Destructive on purpose: the caller's
+    self.messages is truncated, which also stops the loop from growing
+    without bound across steps.
+
+    Strategy:
+      - If there are enough messages to spare, keep the system prompt and
+        the last `keep_tail` messages, replacing everything before them
+        with a one-line note.
+      - Otherwise truncate the longest messages in place.
+    """
+    if len(messages) > keep_tail + 1:
+        system = messages[0] if messages and messages[0]["role"] == "system" else None
+        tail = messages[-keep_tail:]
+        new_tail = []
+        for m in tail:
+            c = m.get("content", "") or ""
+            if len(c) > tool_output_chars:
+                c = c[:tool_output_chars] + "\n...[truncated to fit context window]"
+            new_tail.append({**m, "content": c})
+        messages[:] = (
+            ([system] if system else [])
+            + [{
+                "role": "user",
+                "content": "[Earlier tool outputs were elided to fit the model's context window.]",
+            }]
+            + new_tail
+        )
+        return
+
+    # Too few messages to drop — truncate the big ones in place.
+    for m in messages:
+        c = m.get("content", "") or ""
+        if len(c) > tool_output_chars:
+            m["content"] = c[:tool_output_chars] + "\n...[truncated]"
 
 
 def chat_with_fallback(
@@ -206,14 +278,23 @@ def chat_with_fallback(
     where tool_calls is a list (possibly empty — a model can request
     several tool calls in one turn, not just one) and model_info records
     which (provider, model) actually answered.
+
+    Failure handling:
+      - Output-token exhaustion ("finish_reason == 'length'" / MAX_TOKENS)
+        is treated as a failure, not a valid answer: the reply may be
+        truncated mid-tool-call, so the model is blacklisted, the context
+        is compacted, and the next model is tried.
+      - Context-length rejections compact messages before failing over.
+      - Plain 429/5xx errors retry in place with exponential backoff.
     """
+    last_error: Optional[Exception] = None
+
     for provider, model in MODEL_PIPELINE:
         if TRACKER.is_failed(provider, model):
             continue
 
         if provider in OPENAI_STYLE_CLIENTS:
-            client = OPENAI_STYLE_CLIENTS[provider]
-            if client is None:
+            if OPENAI_STYLE_CLIENTS[provider] is None:
                 TRACKER.mark_failed(provider, model, "no API key configured")
                 continue
         elif provider == "google" and google_client is None:
@@ -230,9 +311,20 @@ def chat_with_fallback(
                         messages=messages,
                         tools=OPENAI_TOOLS,
                         tool_choice="auto",
-                        temperature=0.2
+                        temperature=0.2,
                     )
                     choice = res.choices[0]
+
+                    # Output budget exhausted mid-reply. Anything the
+                    # model emitted — especially tool calls — may be
+                    # truncated. Do NOT return it as a valid answer.
+                    if choice.finish_reason == "length":
+                        print(f"  [Truncated] {provider} -> {model} hit its output "
+                              f"token cap; compacting context and failing over.")
+                        TRACKER.mark_failed(provider, model, "output token limit")
+                        _compact_messages(messages)
+                        break
+
                     text = choice.message.content or ""
 
                     tool_calls: List[Dict[str, Any]] = []
@@ -260,14 +352,47 @@ def chat_with_fallback(
                         contents=contents,
                         config={
                             "system_instruction": system_instruction,
-                            "temperature": 0.2
-                        }
+                            "temperature": 0.2,
+                        },
                     )
-                    return res.text or "", [], {"provider": provider, "model": model}
+
+                    # Detect output truncation. The google-genai SDK
+                    # surfaces this on candidates[0].finish_reason.
+                    finish = None
+                    try:
+                        finish = str(res.candidates[0].finish_reason).upper()
+                    except (AttributeError, IndexError, TypeError):
+                        pass
+
+                    if finish and "MAX_TOKENS" in finish:
+                        print(f"  [Truncated] google -> {model} hit its output "
+                              f"token cap; compacting context and failing over.")
+                        TRACKER.mark_failed(provider, model, "output token limit")
+                        _compact_messages(messages)
+                        break
+
+                    # res.text raises if the response has no text part
+                    # (e.g. safety block, or a function-call-only reply).
+                    try:
+                        text = res.text or ""
+                    except (ValueError, AttributeError):
+                        text = ""
+
+                    return text, [], {"provider": provider, "model": model}
 
             except Exception as e:
                 err_type = type(e).__name__
-                if _is_transient_error(e) and attempt < MAX_TRANSIENT_RETRIES:
+                kind = _classify_error(e)
+                last_error = e
+
+                if kind == "context_length":
+                    print(f"  [Context] {provider} -> {model} rejected the payload "
+                          f"({err_type}: {e}); compacting and failing over.")
+                    TRACKER.mark_failed(provider, model, "context length")
+                    _compact_messages(messages)
+                    break
+
+                if kind == "transient" and attempt < MAX_TRANSIENT_RETRIES:
                     attempt += 1
                     wait = RETRY_BACKOFF_BASE_S * (2 ** (attempt - 1))
                     print(f"  [Retry] {provider} -> {model} transient error "
@@ -280,7 +405,10 @@ def chat_with_fallback(
                 TRACKER.mark_failed(provider, model, err_type)
                 break  # give up on this (provider, model); try the next one
 
-    raise RuntimeError(f"All models failed or were rate-limited. Summary: {TRACKER.status_summary()}")
+    raise RuntimeError(
+        f"All models failed or were rate-limited. Summary: {TRACKER.status_summary()}"
+        + (f" | Last error: {last_error}" if last_error else "")
+    )
 
 # ==========================================
 # 4. Harness Agent
@@ -441,6 +569,10 @@ class HarnessAgent:
 
                     try:
                         result = call_tool(tool_name, tool_args)
+                        # Truncate *before* building the observation string,
+                        # not just at display time. Otherwise the full
+                        # untruncated dump goes into self.messages and the
+                        # context balloons silently across steps.
                         observation = json.dumps(result, indent=2)[:functions.MAX_OUTPUT_BYTES]
                     except Exception as e:
                         result = {"error": f"{type(e).__name__}: {e}"}
@@ -452,7 +584,7 @@ class HarnessAgent:
                 obs_message = "\n\n".join(observations)
                 self.messages.append({"role": "user", "content": obs_message})
             else:
-                yield {"type": "final", "content": text_response or ""}
+                yield {"type": "final"}
                 return
 
         yield {"type": "max_iterations"}
